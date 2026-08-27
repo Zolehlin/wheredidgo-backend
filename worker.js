@@ -1,16 +1,5 @@
 /**
  * WhereDidItGo? — backend Worker
- * Handles: understanding the query (Google Gemini), real web search (Tavily),
- * and historical snapshots (Wayback Machine — no key needed).
- *
- * SETUP:
- * 1. In Cloudflare dashboard, open this Worker's Settings → Variables and Secrets
- * 2. Add secret: TAVILY_API_KEY  = your Tavily key
- * 3. Add secret: GEMINI_API_KEY = your Google AI Studio key (aistudio.google.com)
- * 4. Deploy
- *
- * Your frontend calls: POST https://<this-worker>.workers.dev/search
- * Body: { "query": "the thing you remember" }
  */
 
 export default {
@@ -27,7 +16,7 @@ export default {
 
     const url = new URL(request.url);
 
-    // DEBUG MODE: visit /search?debug=your+query directly in a browser to test
+    // DEBUG MODE: visit /search?debug=your+query directly in a browser
     if (request.method === "GET" && url.searchParams.get("debug")) {
       const query = url.searchParams.get("debug");
       const debug = {};
@@ -122,33 +111,75 @@ Respond ONLY with JSON, no other text, in this exact shape:
 {"searchQueries": ["...", "..."], "clues": ["...", "..."], "category": "..."}`;
 
   const text = await callGemini(prompt, apiKey);
-  const clean = text.replace(/```json|```/g, "").trim();
+  const clean = cleanJsonResponse(text);
+  
   try {
     return JSON.parse(clean);
-  } catch {
+  } catch (err) {
+    console.error("Failed to parse understanding JSON:", clean);
     return { searchQueries: [query], clues: [query], category: "other" };
   }
 }
 
 async function callGemini(prompt, apiKey) {
-  const res = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        contents: [{ parts: [{ text: prompt }] }],
-      }),
-    }
-  );
+  if (!apiKey) {
+    console.error("GEMINI_API_KEY is missing!");
+    return "";
+  }
+
+  // Updated to valid Gemini endpoint (gemini-1.5-flash or gemini-1.5-pro)
+  const endpoint = `[https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=$](https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=$){apiKey}`;
+  
+  const res = await fetch(endpoint, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      contents: [{ parts: [{ text: prompt }] }],
+      // Use responseMimeType to guarantee raw valid JSON returned from Gemini
+      generationConfig: {
+        responseMimeType: "application/json"
+      },
+      safetySettings: [
+        { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
+        { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" },
+        { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" },
+        { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_NONE" }
+      ]
+    }),
+  });
+
   const data = await res.json();
-  return (
-    data.candidates?.[0]?.content?.parts?.map((p) => p.text || "").join("") || ""
-  );
+
+  if (!res.ok) {
+    console.error("Gemini API Error Response:", JSON.stringify(data));
+    return "";
+  }
+
+  const outputText = data.candidates?.[0]?.content?.parts?.map((p) => p.text || "").join("") || "";
+  
+  if (!outputText) {
+    console.warn("Gemini candidate block reason:", data.candidates?.[0]?.finishReason);
+  }
+
+  return outputText;
+}
+
+// Helper to strip markdown formatting cleanly
+function cleanJsonResponse(rawText) {
+  return rawText
+    .replace(/^```json/g, "")
+    .replace(/^```/g, "")
+    .replace(/```$/g, "")
+    .trim();
 }
 
 /* ---------------- STEP 2: Real web search via Tavily ---------------- */
 async function tavilySearch(query, apiKey) {
+  if (!apiKey) {
+    console.error("TAVILY_API_KEY is missing!");
+    return [];
+  }
+
   const res = await fetch("https://api.tavily.com/search", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -205,16 +236,17 @@ Respond ONLY with JSON in this exact shape:
 {"matches": [{"index": 0, "score": 82, "matchedClues": ["..."], "mismatchedClues": ["..."], "reasoning": "one sentence"}]}`;
 
   const text = await callGemini(prompt, apiKey);
-  const clean = text.replace(/```json|```/g, "").trim();
+  const clean = cleanJsonResponse(text);
 
   let parsed;
   try {
     parsed = JSON.parse(clean);
-  } catch {
+  } catch (err) {
+    console.error("Failed to parse ranking JSON:", clean);
     parsed = { matches: [] };
   }
 
-  return parsed.matches
+  return (parsed.matches || [])
     .filter((m) => candidates[m.index])
     .map((m) => ({
       ...candidates[m.index],
@@ -237,6 +269,6 @@ async function getWaybackInfo(domain) {
   return {
     available: snap.available,
     url: snap.url,
-    timestamp: snap.timestamp, // format: YYYYMMDDhhmmss
+    timestamp: snap.timestamp,
   };
 }

@@ -149,7 +149,7 @@ Respond ONLY with JSON, no other text, in this exact shape:
   }
 }
 
-async function callGemini(prompt, apiKey) {
+async function callGemini(prompt, apiKey, attempt = 1) {
   const res = await fetch(
     `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${apiKey}`,
     {
@@ -161,9 +161,19 @@ async function callGemini(prompt, apiKey) {
     }
   );
   const data = await res.json();
+
   if (data.error) {
-    throw new Error(`Gemini API error: ${data.error.message || JSON.stringify(data.error)}`);
+    const msg = data.error.message || JSON.stringify(data.error);
+    const isTransient = res.status === 503 || res.status === 429 || /high demand|overloaded|try again/i.test(msg);
+
+    if (isTransient && attempt < 3) {
+      // brief backoff, then retry — most "high demand" errors clear within a couple seconds
+      await new Promise((r) => setTimeout(r, 600 * attempt));
+      return callGemini(prompt, apiKey, attempt + 1);
+    }
+    throw new Error(`Gemini API error: ${msg}`);
   }
+
   return (
     data.candidates?.[0]?.content?.parts?.map((p) => p.text || "").join("") || ""
   );

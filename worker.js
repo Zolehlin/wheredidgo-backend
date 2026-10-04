@@ -11,7 +11,12 @@
  *
  * Your frontend calls: POST https://<this-worker>.workers.dev/search
  * Body: { "query": "the thing you remember" }
+ *
+ * DEBUG: GET https://<this-worker>.workers.dev/?debug=your+query
+ * Runs the full pipeline step by step and reports exactly where it fails.
  */
+
+const GEMINI_MODEL = 'gemini-3.6-flash';
 
 export default {
   async fetch(request, env) {
@@ -27,24 +32,53 @@ export default {
 
     const url = new URL(request.url);
 
-    // DEBUG MODE: visit /search?debug=your+query directly in a browser to test
+    // FULL PIPELINE DEBUG: visit /?debug=your+query directly in a browser
     if (request.method === "GET" && url.searchParams.get("debug")) {
       const query = url.searchParams.get("debug");
-      const debug = {};
+      const debug = { query };
+
+      // Step 1: understanding
       try {
-        const res = await fetch(
-          `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key=${env.GEMINI_API_KEY}`,
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ contents: [{ parts: [{ text: "Say hello in JSON: {\"msg\":\"...\"}" }] }] }),
-          }
+        const understanding = await understandQuery(query, env.GEMINI_API_KEY);
+        debug.step1_understanding = understanding;
+      } catch (e) {
+        debug.step1_error = String(e);
+        return json(debug, 200, corsHeaders);
+      }
+
+      // Step 2: Tavily search
+      try {
+        const searchResults = await Promise.all(
+          debug.step1_understanding.searchQueries.map((q) => tavilySearch(q, env.TAVILY_API_KEY))
         );
-        debug.geminiHttpStatus = res.status;
-        debug.geminiRawResponse = await res.json();
-        debug.geminiKeyPresent = !!env.GEMINI_API_KEY;
-        debug.geminiKeyLength = env.GEMINI_API_KEY ? env.GEMINI_API_KEY.length : 0;
-      } catch (e) { debug.geminiFetchError = String(e); }
+        const flat = searchResults.flat();
+        debug.step2_tavily_totalRawResults = flat.length;
+        debug.step2_tavily_firstResult = flat[0] || null;
+        debug.step2_tavily_perQueryCounts = searchResults.map((r) => r.length);
+
+        const candidates = dedupeCandidates(flat);
+        debug.step2_candidateCount = candidates.length;
+        debug.step2_candidates = candidates.map(c => ({title:c.title, domain:c.domain}));
+
+        // Step 3: ranking
+        if (candidates.length > 0) {
+          try {
+            const ranked = await rankCandidates(query, debug.step1_understanding, candidates, env.GEMINI_API_KEY);
+            debug.step3_rankedCount = ranked.length;
+            debug.step3_ranked = ranked.map(r => ({title:r.title, domain:r.domain, score:r.score}));
+          } catch (e) {
+            debug.step3_error = String(e);
+          }
+        } else {
+          debug.step3_skipped = "no candidates from Tavily to rank";
+        }
+      } catch (e) {
+        debug.step2_error = String(e);
+      }
+
+      debug.tavilyKeyPresent = !!env.TAVILY_API_KEY;
+      debug.tavilyKeyLength = env.TAVILY_API_KEY ? env.TAVILY_API_KEY.length : 0;
+      debug.geminiKeyPresent = !!env.GEMINI_API_KEY;
 
       return json(debug, 200, corsHeaders);
     }
@@ -92,7 +126,7 @@ function json(obj, status, corsHeaders) {
   });
 }
 
-/* ---------------- STEP 1: Query understanding via Gemini ---------------- */
+/* ---------------- Query understanding via Gemini ---------------- */
 async function understandQuery(query, apiKey) {
   const prompt = `A user is trying to remember a website/app/tool/game from the internet. Here is their description:
 
@@ -117,7 +151,7 @@ Respond ONLY with JSON, no other text, in this exact shape:
 
 async function callGemini(prompt, apiKey) {
   const res = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key=${apiKey}`,
+    `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${apiKey}`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -127,12 +161,15 @@ async function callGemini(prompt, apiKey) {
     }
   );
   const data = await res.json();
+  if (data.error) {
+    throw new Error(`Gemini API error: ${data.error.message || JSON.stringify(data.error)}`);
+  }
   return (
     data.candidates?.[0]?.content?.parts?.map((p) => p.text || "").join("") || ""
   );
 }
 
-/* ---------------- STEP 2: Real web search via Tavily ---------------- */
+/* ---------------- Real web search via Tavily ---------------- */
 async function tavilySearch(query, apiKey) {
   const res = await fetch("https://api.tavily.com/search", {
     method: "POST",
@@ -145,6 +182,9 @@ async function tavilySearch(query, apiKey) {
     }),
   });
   const data = await res.json();
+  if (data.error) {
+    throw new Error(`Tavily API error: ${JSON.stringify(data)}`);
+  }
   return (data.results || []).map((r) => ({
     title: r.title,
     url: r.url,
@@ -170,7 +210,7 @@ function dedupeCandidates(list) {
   });
 }
 
-/* ---------------- STEP 3: Rank real candidates via Gemini ---------------- */
+/* ---------------- Rank real candidates via Gemini ---------------- */
 async function rankCandidates(originalQuery, understanding, candidates, apiKey) {
   if (candidates.length === 0) return [];
 
@@ -211,7 +251,7 @@ Respond ONLY with JSON in this exact shape:
     .sort((a, b) => b.score - a.score);
 }
 
-/* ---------------- STEP 4: Wayback Machine (free, no key) ---------------- */
+/* ---------------- Wayback Machine (free, no key) ---------------- */
 async function getWaybackInfo(domain) {
   const res = await fetch(
     `https://archive.org/wayback/available?url=${encodeURIComponent(domain)}`
@@ -222,6 +262,6 @@ async function getWaybackInfo(domain) {
   return {
     available: snap.available,
     url: snap.url,
-    timestamp: snap.timestamp, // format: YYYYMMDDhhmmss
+    timestamp: snap.timestamp,
   };
 }
